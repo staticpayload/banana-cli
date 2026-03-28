@@ -1,16 +1,10 @@
-#!/usr/bin/env node
+import fs from "node:fs/promises";
+import path from "node:path";
+import process from "node:process";
 
-"use strict";
+import yargs from "yargs/yargs";
 
-const fs = require("node:fs");
-const path = require("node:path");
-const { Buffer } = require("node:buffer");
-const { URL } = require("node:url");
-
-const yargs = require("yargs/yargs");
-const { hideBin } = require("yargs/helpers");
-
-const MODEL_ALIASES = {
+export const MODEL_ALIASES = {
   "nano-banana-2": "gemini-3.1-flash-image-preview",
   "nano-banana-pro": "nano-banana-pro-preview",
   "gemini-3-flash-image-preview": "gemini-3.1-flash-image-preview",
@@ -23,77 +17,177 @@ const MODEL_ALIASES = {
   "google/nano-banana-pro-preview": "nano-banana-pro-preview"
 };
 
-const MEDIA_LINE_RE = /^\s*MEDIA(?:_PATHS?|_URLS?)?:\s*(.+?)\s*$/i;
-const MEDIA_TOKEN_RE = /<media:[^>]+>/gi;
+export const MEDIA_LINE_RE = /^\s*MEDIA(?:_PATHS?|_URLS?)?:\s*(.+?)\s*$/i;
+export const MEDIA_TOKEN_RE = /<media:[^>]+>/gi;
 
-function resolveModel(model) {
-  if (!model) {
-    return model;
-  }
-  return MODEL_ALIASES[model.trim().toLowerCase()] || model.trim();
+const IMAGE_EXTENSION_BY_MIME = {
+  "image/png": ".png",
+  "image/jpeg": ".jpg",
+  "image/webp": ".webp",
+  "image/gif": ".gif"
+};
+const IMAGE_MIMES = new Set(Object.keys(IMAGE_EXTENSION_BY_MIME));
+const DEFAULT_EDIT_PROMPT = "Create a derivative image based on the attached media.";
+const STDIN_SENTINEL = "__BANANA_STDIN__";
+const ANSI = {
+  reset: "\u001b[0m",
+  red: "\u001b[31m",
+  yellow: "\u001b[33m"
+};
+const OPENCLAW_ENV_KEYS = [
+  "MediaPath",
+  "mediaPath",
+  "MediaPaths",
+  "mediaPaths",
+  "MediaUrl",
+  "mediaUrl",
+  "MediaUrls",
+  "mediaUrls",
+  "MEDIA_PATH",
+  "MEDIA_PATHS",
+  "MEDIA_URL",
+  "MEDIA_URLS",
+  "OPENCLAW_MEDIA",
+  "OPENCLAW_MEDIA_PATH",
+  "OPENCLAW_MEDIA_PATHS",
+  "OPENCLAW_MEDIA_URL",
+  "OPENCLAW_MEDIA_URLS",
+  "MEDIA",
+  "media",
+  "mediaPathUrl",
+  "MediaPathUrl"
+];
+const MEDIA_CONTEXT_KEYS = new Set([
+  "mediapath",
+  "mediapaths",
+  "mediaurl",
+  "mediaurls",
+  "media_path",
+  "media_paths",
+  "media_url",
+  "media_urls",
+  "path",
+  "paths",
+  "url",
+  "urls",
+  "media",
+  "mediaitems",
+  "files",
+  "attachments",
+  "attachment",
+  "image",
+  "images",
+  "source"
+]);
+const OPENCLAW_CONTEXT_KEYS = [
+  "MediaPath",
+  "mediaPath",
+  "MediaPaths",
+  "mediaPaths",
+  "MediaUrl",
+  "mediaUrl",
+  "MediaUrls",
+  "mediaUrls",
+  "MEDIA_PATH",
+  "MEDIA_PATHS",
+  "MEDIA_URL",
+  "MEDIA_URLS",
+  "media",
+  "Media",
+  "attachments",
+  "mediaItems"
+];
+
+function supportsColor(stream, env = process.env) {
+  return Boolean(stream?.isTTY) && !env.NO_COLOR;
 }
 
-function parseCsvish(value) {
-  if (!value) {
+function colorize(text, color, stream, env) {
+  if (!supportsColor(stream, env)) {
+    return text;
+  }
+
+  return `${color}${text}${ANSI.reset}`;
+}
+
+function formatError(message, stderr, env, quiet = false) {
+  const text = String(message || "Unknown error");
+  if (quiet || !supportsColor(stderr, env)) {
+    return text;
+  }
+
+  return `${colorize("Error:", ANSI.red, stderr, env)} ${text}`;
+}
+
+function writeVerbose(stderr, env, quiet, message) {
+  if (quiet) {
+    return;
+  }
+
+  stderr.write(`${colorize("banana:", ANSI.yellow, stderr, env)} ${message}\n`);
+}
+
+export function resolveModel(model) {
+  const normalized = String(model || "").trim();
+  return MODEL_ALIASES[normalized.toLowerCase()] || normalized;
+}
+
+export function sanitizeFilename(value) {
+  const normalized = String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^[-_]+|[-_]+$/g, "");
+
+  return (normalized || "image").slice(0, 24);
+}
+
+export function splitCsvish(value) {
+  const text = String(value || "").trim();
+  if (!text) {
     return [];
   }
 
-  const s = String(value).trim();
-  if (!s) {
-    return [];
-  }
-
-  if ((s.startsWith("[") && s.endsWith("]")) || (s.startsWith("{") && s.endsWith("}"))) {
+  if ((text.startsWith("[") && text.endsWith("]")) || (text.startsWith("{") && text.endsWith("}"))) {
     try {
-      const parsed = JSON.parse(s);
+      const parsed = JSON.parse(text);
       if (Array.isArray(parsed)) {
         return parsed.map((item) => String(item).trim()).filter(Boolean);
       }
-    } catch (_err) {
-      // fallthrough
+    } catch {
+      // Fall through to best-effort splitting.
     }
   }
 
-  if (s.includes(";")) {
-    return s.split(";").map((x) => x.trim()).filter(Boolean);
+  if (text.includes(";")) {
+    return text.split(";").map((item) => item.trim()).filter(Boolean);
   }
-  if (s.includes("\n")) {
-    return s.split(/\r?\n/).map((x) => x.trim()).filter(Boolean);
+  if (text.includes("\n")) {
+    return text.split(/\r?\n/u).map((item) => item.trim()).filter(Boolean);
   }
-  if (s.includes(",")) {
-    return s.split(",").map((x) => x.trim()).filter(Boolean);
+  if (text.includes(",")) {
+    return text.split(",").map((item) => item.trim()).filter(Boolean);
   }
 
-  return [s];
+  return [text];
 }
 
-function sanitizeFileName(value) {
-  const slug = value
-    .toLowerCase()
-    .replace(/[^a-zA-Z0-9_-]+/g, "-")
-    .replace(/-+/g, "-")
-    .replace(/^-+|-+$/g, "");
-
-  return slug || "image";
-}
-
-function parsePromptAndMedia(inputPrompt) {
+export function extractMediaFromPrompt(promptText) {
+  const prompt = String(promptText || "");
   const media = [];
   const lines = [];
 
-  const promptText = inputPrompt || "";
-  for (const line of promptText.split(/\r?\n/)) {
-    const lineMatch = line.match(MEDIA_LINE_RE);
-    if (lineMatch) {
-      parseCsvish(lineMatch[1]).forEach((value) => {
-        if (value) {
-          media.push(value.trim().replace(/^`|`$/g, ""));
-        }
-      });
+  for (const line of prompt.split(/\r?\n/u)) {
+    const match = line.match(MEDIA_LINE_RE);
+    if (match) {
+      const raw = match[1]?.trim().replace(/^`|`$/g, "");
+      if (raw) {
+        media.push(...splitCsvish(raw));
+      }
       continue;
     }
 
-    const cleaned = line.replace(MEDIA_TOKEN_RE, "").trim();
+    const cleaned = line.replace(MEDIA_TOKEN_RE, " ").replace(/\s+/g, " ").trim();
     if (cleaned) {
       lines.push(cleaned);
     }
@@ -105,529 +199,664 @@ function parsePromptAndMedia(inputPrompt) {
   };
 }
 
-function collectMediaFromValue(out, value) {
-  if (!value) {
+function extendMediaList(target, candidates) {
+  for (const rawCandidate of candidates) {
+    if (rawCandidate == null) {
+      continue;
+    }
+
+    for (const value of splitCsvish(String(rawCandidate))) {
+      const cleaned = value.trim().replace(/^`|`$/g, "");
+      if (cleaned) {
+        target.push(cleaned);
+      }
+    }
+  }
+}
+
+function collectMediaFromContextValue(target, value) {
+  if (value == null) {
     return;
   }
 
   if (typeof value === "string") {
-    parseCsvish(value).forEach((item) => {
-      const clean = String(item).trim().replace(/^`|`$/g, "");
-      if (clean) {
-        out.push(clean);
-      }
-    });
+    extendMediaList(target, [value]);
     return;
   }
 
   if (Array.isArray(value)) {
     for (const item of value) {
-      collectMediaFromValue(out, item);
+      collectMediaFromContextValue(target, item);
     }
     return;
   }
 
-  if (typeof value === "object") {
-    const keys = [
-      "mediapath",
-      "mediapaths",
-      "mediaurl",
-      "mediaurls",
-      "media_path",
-      "media_paths",
-      "media_url",
-      "media_urls",
-      "path",
-      "paths",
-      "url",
-      "urls",
-      "media",
-      "mediaitems",
-      "mediaItems",
-      "files",
-      "attachments",
-      "attachment",
-      "image",
-      "images",
-      "source"
-    ];
+  if (typeof value !== "object") {
+    extendMediaList(target, [String(value)]);
+    return;
+  }
 
-    for (const [key, child] of Object.entries(value)) {
-      if (keys.includes(String(key).toLowerCase())) {
-        collectMediaFromValue(out, child);
-      }
+  for (const [key, child] of Object.entries(value)) {
+    if (MEDIA_CONTEXT_KEYS.has(key.trim().toLowerCase())) {
+      collectMediaFromContextValue(target, child);
     }
+  }
 
-    if (value.media !== undefined) {
-      collectMediaFromValue(out, value.media);
-    }
-
-    const nestedPaths =
-      value.mediaPath ||
-      value.MediaPath ||
-      value.mediaPaths ||
-      value.MediaPaths ||
-      value.mediaUrl ||
-      value.MediaUrl ||
-      value.mediaUrls ||
-      value.MediaUrls;
-    if (nestedPaths !== undefined) {
-      collectMediaFromValue(out, nestedPaths);
+  for (const key of [
+    "media",
+    "mediaPaths",
+    "MediaPaths",
+    "mediaPath",
+    "MediaPath",
+    "mediaUrls",
+    "MediaUrls",
+    "mediaUrl",
+    "MediaUrl"
+  ]) {
+    if (value[key] != null) {
+      collectMediaFromContextValue(target, value[key]);
     }
   }
 }
 
-function envMediaSources() {
-  const out = [];
-  const keys = [
-    "MediaPath",
-    "mediaPath",
-    "MediaPaths",
-    "mediaPaths",
-    "MediaUrl",
-    "mediaUrl",
-    "MediaUrls",
-    "mediaUrls",
-    "MEDIA_PATH",
-    "MEDIA_PATHS",
-    "MEDIA_URL",
-    "MEDIA_URLS",
-    "OPENCLAW_MEDIA",
-    "OPENCLAW_MEDIA_PATH",
-    "OPENCLAW_MEDIA_PATHS",
-    "OPENCLAW_MEDIA_URL",
-    "OPENCLAW_MEDIA_URLS",
-    "MEDIA",
-    "media",
-    "mediaPathUrl",
-    "MediaPathUrl"
-  ];
+export function envMediaSources(env = process.env) {
+  const sources = [];
 
-  for (const key of keys) {
-    const value = process.env[key];
-    if (value) {
-      collectMediaFromValue(out, value);
+  for (const key of OPENCLAW_ENV_KEYS) {
+    if (env[key]) {
+      extendMediaList(sources, [env[key]]);
     }
   }
 
-  const context = process.env.OPENCLAW_CONTEXT;
-  if (context) {
+  if (env.OPENCLAW_CONTEXT) {
     try {
-      const parsed = JSON.parse(context);
+      const parsed = JSON.parse(env.OPENCLAW_CONTEXT);
       if (parsed && typeof parsed === "object") {
-        for (const key of keys) {
-          if (parsed[key]) {
-            collectMediaFromValue(out, parsed[key]);
+        for (const key of OPENCLAW_CONTEXT_KEYS) {
+          if (parsed[key] != null) {
+            collectMediaFromContextValue(sources, parsed[key]);
           }
         }
-        collectMediaFromValue(out, parsed);
+
+        collectMediaFromContextValue(sources, parsed);
       }
-    } catch (_err) {
-      // ignore malformed JSON context
+    } catch {
+      const { media } = extractMediaFromPrompt(env.OPENCLAW_CONTEXT);
+      extendMediaList(sources, media);
     }
   }
 
   const seen = new Set();
-  return out.filter((item) => {
-    if (!item || seen.has(item)) {
-      return false;
+  const unique = [];
+  for (const source of sources) {
+    if (!seen.has(source)) {
+      seen.add(source);
+      unique.push(source);
     }
-    seen.add(item);
-    return true;
-  });
+  }
+
+  return unique;
 }
 
-function isHttpUrl(source) {
+export function dedupeMediaSources(sources) {
+  const seen = new Set();
+  const unique = [];
+
+  for (const source of sources) {
+    const cleaned = String(source || "").trim().replace(/^`|`$/g, "");
+    if (!cleaned || seen.has(cleaned)) {
+      continue;
+    }
+    seen.add(cleaned);
+    unique.push(cleaned);
+  }
+
+  return unique;
+}
+
+function inferMimeFromPath(filePath) {
+  const extension = path.extname(String(filePath || "")).toLowerCase();
+  if (extension === ".png") {
+    return "image/png";
+  }
+  if (extension === ".jpg" || extension === ".jpeg") {
+    return "image/jpeg";
+  }
+  if (extension === ".webp") {
+    return "image/webp";
+  }
+  if (extension === ".gif") {
+    return "image/gif";
+  }
+  return "";
+}
+
+function getImageMime(image) {
+  return image?.mime || image?.mimeType || "";
+}
+
+export function detectImageMime(buffer, hints = {}) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 4) {
+    throw new Error("Image payload is empty or invalid.");
+  }
+
+  const { pathHint = "", contentTypeHint = "" } = hints;
+  const contentType = String(contentTypeHint || "").toLowerCase();
+  if (contentType && !contentType.startsWith("image/")) {
+    throw new Error(`Expected image media but received ${contentType}.`);
+  }
+
+  if (
+    buffer.length >= 8 &&
+    buffer[0] === 0x89 &&
+    buffer[1] === 0x50 &&
+    buffer[2] === 0x4e &&
+    buffer[3] === 0x47 &&
+    buffer[4] === 0x0d &&
+    buffer[5] === 0x0a &&
+    buffer[6] === 0x1a &&
+    buffer[7] === 0x0a
+  ) {
+    return "image/png";
+  }
+
+  if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
+    return "image/jpeg";
+  }
+
+  if (buffer.subarray(0, 6).toString("ascii") === "GIF87a" || buffer.subarray(0, 6).toString("ascii") === "GIF89a") {
+    return "image/gif";
+  }
+
+  if (
+    buffer.length >= 12 &&
+    buffer.subarray(0, 4).toString("ascii") === "RIFF" &&
+    buffer.subarray(8, 12).toString("ascii") === "WEBP"
+  ) {
+    return "image/webp";
+  }
+
+  const pathMime = inferMimeFromPath(pathHint);
+  if (pathMime && IMAGE_MIMES.has(pathMime)) {
+    throw new Error(`Image signature does not match file extension for ${pathHint}.`);
+  }
+
+  throw new Error("Unsupported or unrecognized image format. Supported formats: PNG, JPEG, WEBP, GIF.");
+}
+
+function decodeBase64Image(base64Data, expectedMime) {
+  const buffer = Buffer.from(base64Data, "base64");
+  const detectedMime = detectImageMime(buffer, { contentTypeHint: expectedMime });
+  return { buffer, mime: detectedMime };
+}
+
+export async function loadMediaPayload(source, options = {}) {
+  const cleaned = String(source || "").trim().replace(/^`|`$/g, "");
+  if (!cleaned) {
+    throw new Error("Empty media source.");
+  }
+
+  const { cwd = process.cwd() } = options;
+  let buffer;
+  let contentTypeHint = "";
+
+  if (/^https?:\/\//iu.test(cleaned)) {
+    const response = await (options.fetchImpl || fetch)(cleaned);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch reference image: HTTP ${response.status}.`);
+    }
+    const arrayBuffer = await response.arrayBuffer();
+    buffer = Buffer.from(arrayBuffer);
+    contentTypeHint = response.headers.get("content-type") || "";
+  } else {
+    const resolvedPath = path.resolve(cwd, cleaned);
+    try {
+      buffer = await fs.readFile(resolvedPath);
+    } catch {
+      throw new Error(`Input image not found: ${resolvedPath}`);
+    }
+    contentTypeHint = inferMimeFromPath(resolvedPath);
+  }
+
+  const mimeType = detectImageMime(buffer, {
+    pathHint: cleaned,
+    contentTypeHint
+  });
+
+  return {
+    mimeType,
+    data: buffer.toString("base64")
+  };
+}
+
+function extractInlineData(node) {
+  if (!node || typeof node !== "object") {
+    return null;
+  }
+
+  const inlineData = node.inlineData || node.inline_data;
+  if (!inlineData || typeof inlineData !== "object") {
+    return null;
+  }
+
+  return {
+    mimeType: inlineData.mimeType || inlineData.mime_type,
+    data: inlineData.data
+  };
+}
+
+export function extractImages(payload) {
+  const images = [];
+  const candidates = Array.isArray(payload?.candidates) ? payload.candidates : [];
+
+  for (const candidate of candidates) {
+    const parts = Array.isArray(candidate?.content?.parts) ? candidate.content.parts : [];
+    for (const part of parts) {
+      const inlineData = extractInlineData(part);
+      if (inlineData?.data) {
+        const { buffer, mime } = decodeBase64Image(inlineData.data, inlineData.mimeType);
+        images.push({ buffer, mime });
+      }
+    }
+  }
+
+  const generatedImages = Array.isArray(payload?.generatedImages) ? payload.generatedImages : [];
+  for (const imageNode of generatedImages) {
+    const inlineData = extractInlineData(imageNode);
+    if (inlineData?.data) {
+      const { buffer, mime } = decodeBase64Image(inlineData.data, inlineData.mimeType);
+      images.push({ buffer, mime });
+    }
+  }
+
+  return images;
+}
+
+function getOutputExtension(mime) {
+  return IMAGE_EXTENSION_BY_MIME[mime] || ".png";
+}
+
+async function pathExists(filePath) {
   try {
-    const url = new URL(source);
-    return url.protocol === "http:" || url.protocol === "https:";
-  } catch (_err) {
+    await fs.access(filePath);
+    return true;
+  } catch {
     return false;
   }
 }
 
-function detectImageType(data) {
-  if (!Buffer.isBuffer(data) || data.length < 12) {
-    return null;
+async function ensureUniquePath(filePath) {
+  const parsed = path.parse(filePath);
+  let candidate = filePath;
+  let index = 1;
+
+  while (await pathExists(candidate)) {
+    candidate = path.join(parsed.dir, `${parsed.name}-${index}${parsed.ext}`);
+    index += 1;
   }
 
-  if (
-    data[0] === 0x89 &&
-    data[1] === 0x50 &&
-    data[2] === 0x4e &&
-    data[3] === 0x47 &&
-    data[4] === 0x0d &&
-    data[5] === 0x0a &&
-    data[6] === 0x1a &&
-    data[7] === 0x0a
-  ) {
-    return { mimeType: "image/png", extension: ".png" };
-  }
-
-  if (data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) {
-    return { mimeType: "image/jpeg", extension: ".jpg" };
-  }
-
-  if (
-    data[0] === 0x47 &&
-    data[1] === 0x49 &&
-    data[2] === 0x46 &&
-    (data.subarray(0, 6).toString("ascii") === "GIF87a" ||
-      data.subarray(0, 6).toString("ascii") === "GIF89a")
-  ) {
-    return { mimeType: "image/gif", extension: ".gif" };
-  }
-
-  if (
-    data.subarray(0, 4).toString("ascii") === "RIFF" &&
-    data.subarray(8, 12).toString("ascii") === "WEBP"
-  ) {
-    return { mimeType: "image/webp", extension: ".webp" };
-  }
-
-  return null;
+  return candidate;
 }
 
-function validateImageBuffer(data, label) {
-  const detected = detectImageType(data);
-  if (!detected) {
-    throw new Error(`Invalid or unsupported image data${label ? ` for ${label}` : ""}`);
+async function isDirectoryTarget(targetPath) {
+  try {
+    return (await fs.stat(targetPath)).isDirectory();
+  } catch {
+    return false;
   }
-  return detected;
 }
 
-async function loadMedia(source) {
-  const cleanSource = String(source).trim().replace(/^`|`$/g, "");
-  if (!cleanSource) {
-    throw new Error("Empty media source");
-  }
+export async function planOutputPaths(images, prompt, outPath = "", cwd = process.cwd()) {
+  const slug = sanitizeFilename(prompt);
+  const planned = [];
 
-  let data;
+  if (outPath) {
+    const absoluteOut = path.resolve(cwd, outPath);
+    const treatAsDirectory =
+      outPath.endsWith(path.sep) ||
+      outPath.endsWith("/") ||
+      outPath.endsWith("\\") ||
+      (await isDirectoryTarget(absoluteOut));
+    const outDirectory = treatAsDirectory ? absoluteOut : path.dirname(absoluteOut);
+    const providedBase = path.parse(absoluteOut);
+    const baseName = treatAsDirectory ? slug : providedBase.name || slug;
 
-  if (isHttpUrl(cleanSource)) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 30000);
-    try {
-      const response = await fetch(cleanSource, { signal: controller.signal });
-      if (!response.ok) {
-        throw new Error(`Failed to fetch media: ${response.status} ${response.statusText}`);
-      }
-      data = Buffer.from(await response.arrayBuffer());
-    } finally {
-      clearTimeout(timeout);
+    for (let index = 0; index < images.length; index += 1) {
+      const suffix = getOutputExtension(getImageMime(images[index]));
+      const stem = images.length === 1 ? baseName : `${baseName}_${index + 1}`;
+      const candidate = path.join(outDirectory, `${stem}${suffix}`);
+      planned.push(await ensureUniquePath(candidate));
     }
-  } else {
-    const fullPath = path.resolve(cleanSource);
-    data = await fs.promises.readFile(fullPath);
+
+    return planned;
   }
 
-  const detected = validateImageBuffer(data, cleanSource);
-  return {
-    data: data.toString("base64"),
-    mimeType: detected.mimeType
-  };
+  for (let index = 0; index < images.length; index += 1) {
+    const suffix = getOutputExtension(getImageMime(images[index]));
+    const stem = images.length === 1 ? slug : `${slug}_${index + 1}`;
+    const candidate = path.join(cwd, `${stem}${suffix}`);
+    planned.push(await ensureUniquePath(candidate));
+  }
+
+  return planned;
 }
 
-function toOutputPaths(basePrompt, images, outputFlag) {
-  const result = [];
+export async function writeImages(images, prompt, outPath = "", cwd = process.cwd()) {
+  const outputPaths = await planOutputPaths(images, prompt, outPath, cwd);
 
-  const chooseSuffix = (mime) => {
-    const map = {
-      "image/png": ".png",
-      "image/jpeg": ".jpg",
-      "image/webp": ".webp",
-      "image/gif": ".gif"
-    };
-
-    return map[mime] || ".png";
-  };
-
-  const ensureParent = (p) => {
-    const parent = path.dirname(p);
-    if (!fs.existsSync(parent)) {
-      fs.mkdirSync(parent, { recursive: true });
-    }
-    return p;
-  };
-
-  if (outputFlag) {
-    const requested = path.resolve(outputFlag);
-    const parsed = path.parse(requested);
-    const stem = parsed.name.trim() || "image";
-    const directory = parsed.dir || process.cwd();
-
-    if (images.length === 1) {
-      const suffix = chooseSuffix(images[0].mimeType);
-      result.push(ensureParent(path.resolve(directory, `${stem}${suffix}`)));
-      return result;
-    }
-
-    for (let i = 0; i < images.length; i += 1) {
-      const suffix = chooseSuffix(images[i].mimeType);
-      const fileName = `${stem}_${i + 1}${suffix}`;
-      result.push(ensureParent(path.resolve(directory, fileName)));
-    }
-    return result;
-  }
-
-  const stem = sanitizeFileName(basePrompt);
-  for (let i = 0; i < images.length; i += 1) {
-    const suffix = chooseSuffix(images[i].mimeType);
-    const fileName = images.length > 1 ? `${stem}_${i + 1}${suffix}` : `${stem}${suffix}`;
-    result.push(path.resolve(process.cwd(), fileName));
-  }
-
-  return result;
-}
-
-function extractTextParts(parsed) {
-  const lines = [];
-
-  if (Array.isArray(parsed?.candidates)) {
-    for (const candidate of parsed.candidates) {
-      const parts = candidate?.content?.parts || [];
-      for (const part of parts) {
-        if (typeof part?.text === "string" && part.text.trim()) {
-          lines.push(part.text.trim());
-        }
-      }
+  for (let index = 0; index < images.length; index += 1) {
+    const filePath = outputPaths[index];
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    await fs.writeFile(filePath, images[index].buffer);
+    const stats = await fs.stat(filePath);
+    if (!stats.isFile() || stats.size <= 0) {
+      throw new Error(`Generated file was not written correctly: ${filePath}`);
     }
   }
 
-  return Array.from(new Set(lines));
+  return outputPaths;
 }
 
-async function extractPrompt(args) {
-  const positional = (args._ || []).join(" ").trim();
-  const explicitPrompt = args.prompt;
+export async function replyMediaPath(filePath, cwd = process.cwd()) {
+  const absolutePath = path.resolve(filePath);
+  const absoluteCwd = path.resolve(cwd);
 
-  let prompt = explicitPrompt || positional;
-
-  const stdinText =
-    args.prompt === "-" || (positional === "" && !explicitPrompt && !process.stdin.isTTY);
-
-  if (prompt === "-" || stdinText) {
-    prompt = await new Promise((resolve, reject) => {
-      let data = "";
-      process.stdin.setEncoding("utf8");
-      process.stdin.on("data", (chunk) => {
-        data += chunk;
-      });
-      process.stdin.on("end", () => resolve(data.trim()));
-      process.stdin.on("error", reject);
-      if (process.stdin.isTTY === false) {
-        process.stdin.resume();
-      }
-    });
+  if (!(await pathExists(absolutePath))) {
+    return filePath;
   }
 
-  const cleaned = parsePromptAndMedia(prompt || "");
-  let finalPrompt = cleaned.prompt || prompt || "";
-
-  if (!finalPrompt && !args.media?.length && !cleaned.media.length && !envMediaSources().length) {
-    finalPrompt = "";
+  const relativePath = path.relative(absoluteCwd, absolutePath);
+  if (relativePath && !relativePath.startsWith("..") && !path.isAbsolute(relativePath)) {
+    return `./${relativePath}`;
   }
 
-  return {
-    prompt: finalPrompt,
-    inlineMedia: cleaned.media
-  };
+  return absolutePath;
 }
 
-async function run() {
-  const argv = yargs(hideBin(process.argv))
+export const __internal = {
+  resolveModel,
+  sanitizeFilename,
+  splitCsvish,
+  extractMediaFromPrompt,
+  envMediaSources,
+  dedupeMediaSources,
+  detectImageMime,
+  planOutputPaths,
+  replyMediaPath
+};
+
+export async function readPromptFromStdin(stdin = process.stdin) {
+  const chunks = [];
+  for await (const chunk of stdin) {
+    chunks.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+  }
+  return chunks.join("").trim();
+}
+
+function createParser(argvInput, stdout = process.stdout) {
+  return yargs(argvInput)
     .scriptName("banana")
-    .usage("$0 [options] [prompt]")
+    .usage("$0 [options] [prompt text]")
+    .wrap(Math.min(stdout.columns || 96, 96))
+    .example('$0 "text prompt"', "Generate an image from a text prompt.")
+    .example("$0 --media /path/to/image.jpg \"edit this\"", "Edit from a reference image.")
+    .example(
+      "$0 --media /path/to/image.jpg --model nano-banana-2 --count 2 --out out.png --json response.json",
+      "Generate multiple images and save the raw response."
+    )
+    .example("$0 -m /path/to/image.jpg -o ./renders/", "Write generated files into a directory.")
+    .example("cat prompt.txt | $0 --prompt -", "Read the prompt from stdin.")
     .option("prompt", {
       alias: "p",
       type: "string",
-      describe: "Prompt text (or use '-' to read stdin)"
+      describe: "Prompt text. Use '-' to read the prompt from stdin."
+    })
+    .option("stdin", {
+      type: "boolean",
+      default: false,
+      describe: "Read prompt text from stdin when no explicit prompt is provided."
     })
     .option("media", {
       alias: "m",
       type: "string",
       array: true,
-      describe: "Reference image path or URL (repeatable)"
+      default: [],
+      describe: "Reference image path or URL. Repeatable; only the first resolved media is used."
     })
     .option("model", {
       type: "string",
       default: "nano-banana-pro",
-      describe: "Model alias/name"
+      describe: "Model alias or model id."
     })
     .option("count", {
       type: "number",
       default: 1,
-      describe: "Images to request (1-4)"
+      describe: "Number of images to request (1-4)."
     })
     .option("out", {
+      alias: "o",
       type: "string",
-      describe: "Output path (optional)"
+      describe: "Output file path or directory. Multiple images append _1, _2, ... automatically."
     })
     .option("json", {
       type: "string",
-      describe: "Write full API response JSON to this path"
+      describe: "Optional path to save the raw JSON API response."
     })
     .option("verbose", {
       alias: "v",
       type: "boolean",
       default: false,
-      describe: "Print request details to stderr"
+      describe: "Print resolved model and media details to stderr."
     })
-    .help()
+    .option("quiet", {
+      alias: "q",
+      type: "boolean",
+      default: false,
+      describe: "Suppress non-essential stderr output. Errors remain plain."
+    })
+    .group(["prompt", "stdin", "media"], "Input:")
+    .group(["model", "count", "out", "json"], "Generation:")
+    .group(["verbose", "quiet", "help", "version"], "Control:")
+    .epilog("Successful runs print plain MEDIA:<path> lines to stdout. Diagnostics stay on stderr.")
     .strict()
-    .parse();
+    .check((argv) => {
+      if (!Number.isInteger(argv.count) || argv.count < 1 || argv.count > 4) {
+        throw new Error("--count must be an integer between 1 and 4.");
+      }
+      return true;
+    })
+    .help();
+}
 
-  const { prompt, inlineMedia } = await extractPrompt(argv);
-
-  let mediaSources = [];
-  if (argv.media) {
-    mediaSources.push(...argv.media);
-  }
-  mediaSources.push(...inlineMedia);
-  mediaSources.push(...envMediaSources());
-
-  mediaSources = Array.from(new Set(mediaSources.map((item) => String(item).trim()).filter(Boolean)));
-
-  const effectivePrompt = (prompt || "").trim();
-  const effectiveCount = Number.isFinite(argv.count) ? Math.max(1, Math.min(4, argv.count)) : 1;
-
-  if (!effectivePrompt && !mediaSources.length) {
-    throw new Error("Provide a prompt, --prompt, stdin input, or --media reference image.");
+export async function getPrompt(argv, stdin = process.stdin) {
+  if (argv.prompt === "-" || argv.prompt === STDIN_SENTINEL) {
+    return readPromptFromStdin(stdin);
   }
 
-  const fallbackPrompt = effectivePrompt
-    ? effectivePrompt
-    : "Create a derivative image based on the attached media.";
+  if (typeof argv.prompt === "string" && argv.prompt.trim()) {
+    return argv.prompt.trim();
+  }
 
+  const positionalPrompt = argv._.map(String).join(" ").trim();
+  if (positionalPrompt) {
+    return positionalPrompt;
+  }
+
+  if (argv.stdin || stdin.isTTY === false) {
+    return readPromptFromStdin(stdin);
+  }
+
+  return "";
+}
+
+export async function generateImages({
+  prompt,
+  mediaSources,
+  model,
+  count,
+  jsonPath = "",
+  outPath = "",
+  verbose = false,
+  quiet = false,
+  env = process.env,
+  fetchImpl = fetch,
+  stdout = process.stdout,
+  stderr = process.stderr,
+  cwd = process.cwd()
+}) {
+  const apiKey = env.GEMINI_API_KEY || env.GOOGLE_API_KEY;
+  if (!apiKey) {
+    throw new Error("Missing GEMINI_API_KEY or GOOGLE_API_KEY.");
+  }
+
+  const resolvedModel = resolveModel(model || "nano-banana-pro");
   const parts = [];
 
-  if (mediaSources.length) {
-    const mediaPayload = await loadMedia(mediaSources[0]);
+  if (mediaSources.length > 0) {
+    const mediaPayload = await loadMediaPayload(mediaSources[0], { fetchImpl, cwd });
     parts.push({ inlineData: mediaPayload });
   }
-  parts.push({ text: fallbackPrompt });
+
+  parts.push({ text: prompt });
 
   const payload = {
     contents: [{ parts }],
     generationConfig: {
       responseModalities: ["IMAGE", "TEXT"],
-      candidateCount: effectiveCount
+      candidateCount: count
     }
   };
 
-  const model = resolveModel(argv.model);
-  const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
-
-  if (!apiKey) {
-    throw new Error("Missing GEMINI_API_KEY (or GOOGLE_API_KEY)");
+  if (verbose && !quiet) {
+    writeVerbose(stderr, env, quiet, `model=${resolvedModel}`);
+    if (mediaSources[0]) {
+      writeVerbose(stderr, env, quiet, `media=${mediaSources[0]}`);
+    }
   }
 
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 60000);
-  let response;
-  try {
-    response = await fetch(endpoint, {
+  const response = await fetchImpl(
+    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(resolvedModel)}:generateContent`,
+    {
       method: "POST",
       headers: {
-        "content-type": "application/json"
+        "content-type": "application/json",
+        "x-goog-api-key": apiKey
       },
-      body: JSON.stringify(payload),
-      signal: controller.signal
-    });
-  } finally {
-    clearTimeout(timeout);
-  }
+      body: JSON.stringify(payload)
+    }
+  );
 
-  const responseText = await response.text();
+  const rawBody = await response.text();
+  let parsedBody;
+  try {
+    parsedBody = JSON.parse(rawBody);
+  } catch {
+    parsedBody = null;
+  }
 
   if (!response.ok) {
-    throw new Error(`Request failed (${response.status}): ${responseText}`);
+    const message = parsedBody ? JSON.stringify(parsedBody) : rawBody;
+    throw new Error(`Gemini request failed with HTTP ${response.status}: ${message}`);
   }
 
-  const parsed = JSON.parse(responseText);
-  if (argv.json) {
-    const jsonPath = path.resolve(argv.json);
-    await fs.promises.mkdir(path.dirname(jsonPath), { recursive: true });
-    await fs.promises.writeFile(jsonPath, JSON.stringify(parsed, null, 2), "utf8");
+  if (!parsedBody) {
+    throw new Error("Gemini returned a non-JSON response.");
   }
 
-  const textLines = extractTextParts(parsed);
-  const images = [];
-  if (Array.isArray(parsed?.candidates)) {
-    for (const candidate of parsed.candidates) {
-      const candidateParts = candidate?.content?.parts || [];
-      for (const part of candidateParts) {
-        if (part?.inlineData?.data) {
-          const raw = Buffer.from(part.inlineData.data, "base64");
-          const detected = validateImageBuffer(raw, "Gemini response");
-          images.push({
-            data: part.inlineData.data,
-            mimeType: detected.mimeType
-          });
-        }
-      }
-    }
+  if (jsonPath) {
+    const absoluteJsonPath = path.resolve(cwd, jsonPath);
+    await fs.mkdir(path.dirname(absoluteJsonPath), { recursive: true });
+    await fs.writeFile(absoluteJsonPath, JSON.stringify(parsedBody, null, 2));
   }
 
-  if (!images.length && Array.isArray(parsed?.generatedImages)) {
-    for (const generated of parsed.generatedImages) {
-      if (generated?.inlineData?.data) {
-        const raw = Buffer.from(generated.inlineData.data, "base64");
-        const detected = validateImageBuffer(raw, "Gemini response");
-        images.push({
-          data: generated.inlineData.data,
-          mimeType: detected.mimeType
-        });
-      }
-    }
+  const images = extractImages(parsedBody);
+  if (images.length === 0) {
+    throw new Error("No image data returned from API.");
   }
 
-  if (!images.length) {
-    throw new Error(`No image data returned by model. Response:\n${JSON.stringify(parsed, null, 2)}`);
+  const writtenPaths = await writeImages(images, prompt, outPath, cwd);
+  const mediaLines = [];
+
+  for (const writtenPath of writtenPaths) {
+    const mediaPath = await replyMediaPath(writtenPath, cwd);
+    mediaLines.push(mediaPath);
+    stdout.write(`MEDIA:${mediaPath}\n`);
   }
 
-  const targetPaths = toOutputPaths(fallbackPrompt, images, argv.out || "");
-
-  if (argv.verbose) {
-    console.error(`Model: ${model}`);
-    console.error(`Prompt: ${fallbackPrompt}`);
-    console.error(`Count: ${images.length}`);
-    console.error(`Output: ${argv.out || "./<auto>"}`);
-  }
-
-  for (const line of textLines) {
-    console.log(line);
-  }
-
-  for (let i = 0; i < images.length; i += 1) {
-    const outputPath = targetPaths[i];
-    const image = images[i];
-    const raw = Buffer.from(image.data, "base64");
-    validateImageBuffer(raw, outputPath);
-
-    await fs.promises.writeFile(outputPath, raw);
-
-    const stats = await fs.promises.stat(outputPath);
-    if (!stats || !stats.size) {
-      throw new Error(`Failed to write generated image: ${outputPath}`);
-    }
-
-    console.log(`MEDIA:${outputPath}`);
-  }
+  return {
+    model: resolvedModel,
+    images: mediaLines,
+    raw: parsedBody
+  };
 }
 
-module.exports = {
-  run,
-  __internal: {
-    sanitizeFileName,
-    parseCsvish,
-    parsePromptAndMedia,
-    toOutputPaths,
-    resolveModel,
-    envMediaSources,
-    detectImageType,
-    validateImageBuffer
+function normalizeArgv(argvInput) {
+  const normalized = [...argvInput];
+
+  for (let index = 0; index < normalized.length - 1; index += 1) {
+    if ((normalized[index] === "--prompt" || normalized[index] === "-p") && normalized[index + 1] === "-") {
+      normalized[index + 1] = STDIN_SENTINEL;
+    }
   }
-};
+
+  return normalized;
+}
+
+export async function runCli(argvInput = process.argv.slice(2), io = {}) {
+  const stdout = io.stdout || process.stdout;
+  const stderr = io.stderr || process.stderr;
+  const stdin = io.stdin || process.stdin;
+  const env = io.env || process.env;
+  const cwd = io.cwd || process.cwd();
+  const fetchImpl = io.fetchImpl || fetch;
+
+  let argv;
+  try {
+    argv = await createParser(normalizeArgv(argvInput), stdout).parse();
+  } catch (error) {
+    stderr.write(`${formatError(error?.message || error, stderr, env)}\n`);
+    return 1;
+  }
+
+  let prompt = await getPrompt(argv, stdin);
+  const extracted = extractMediaFromPrompt(prompt);
+  prompt = extracted.prompt;
+
+  const mediaSources = dedupeMediaSources([
+    ...(argv.media || []),
+    ...extracted.media,
+    ...envMediaSources(env)
+  ]);
+
+  if (!prompt) {
+    prompt = mediaSources.length > 0 ? DEFAULT_EDIT_PROMPT : "";
+  }
+
+  if (!prompt && mediaSources.length === 0) {
+    stderr.write("Missing prompt. Provide text prompt, --prompt -, stdin, or use --media with a reference image.\n");
+    stderr.write('Run "banana --help" for usage.\n');
+    return 2;
+  }
+
+  try {
+    await generateImages({
+      prompt,
+      mediaSources,
+      model: argv.model,
+      count: argv.count,
+      jsonPath: argv.json || "",
+      outPath: argv.out || "",
+      verbose: argv.verbose,
+      quiet: argv.quiet,
+      env,
+      fetchImpl,
+      stdout,
+      stderr,
+      cwd
+    });
+    return 0;
+  } catch (error) {
+    stderr.write(`${formatError(error?.message || error, stderr, env, argv.quiet)}\n`);
+    return 1;
+  }
+}

@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 
-"use strict";
+import { runCli } from "../src/index.js";
 
-const { run } = require("../src/index.js");
-
-run().catch((error) => {
-  console.error(error.message || String(error));
-  process.exitCode = Number.isInteger(error.exitCode) ? error.exitCode : 1;
-});
+try {
+  process.exitCode = await runCli(process.argv.slice(2));
+} catch (error) {
+  process.stderr.write(`${error?.message || error}\n`);
+  process.exitCode = 1;
+}

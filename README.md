@@ -1,67 +1,53 @@
 # banana-cli
 
-`banana` is a CLI wrapper around Gemini image generation endpoints.
+`banana-cli` is a Node.js command-line tool for Gemini image generation and reference-image editing.
 
-It implements the same behavior as the internal `nano-banana` skill:
+## Requirements
 
-- Text prompt generation
-- Optional reference image (`--media`) for image editing
-- Model alias support (`nano-banana-2`, `nano-banana-pro`, etc.)
-- `--count` up to 4 images
-- Optional output path (`--out`)
-- Optional API response dump (`--json`)
-- `MEDIA:<path>` output so downstream tools can attach generated images directly
+- Node.js 20+
+- `GEMINI_API_KEY` or `GOOGLE_API_KEY`
 
-## Setup
+## Install
 
 ```bash
 npm install
-npm link
-```
-
-Set one of these env vars:
-
-```bash
-export GEMINI_API_KEY=...
-# or
-export GOOGLE_API_KEY=...
 ```
 
 ## Usage
 
 ```bash
-# simple prompt
-banana "a cyberpunk racetrack scene"
-
-# edit with reference image
-banana --media ./input.jpg "change this driver's suit to black merc f1 suit"
-
-# explicit model + count + explicit output + JSON dump
-banana --media ./input.jpg --model nano-banana-2 --count 2 --out ./output.png --json ./response.json "make this image cinematic"
-
-# explicit --prompt
-banana --prompt "a brutalist banana logo on cream"
-
-# read prompt from stdin when no positional prompt is provided
-cat prompt.txt | banana
+banana "text prompt"
+banana --media /path/to/image.jpg "edit this"
+banana --media /path/to/image.jpg --model nano-banana-2 --count 2 --out out.png --json response.json
+banana --media /path/to/image.jpg --out ./renders/
+cat prompt.txt | banana --prompt -
 ```
+
+## Behavior
+
+- Default model: `nano-banana-pro`
+- Model aliases map to the Gemini preview image models used by the existing nano-banana workflow
+- `--media` is repeatable, but only the first resolved media source is sent to Gemini
+- If no prompt is provided and media is available, the CLI uses `Create a derivative image based on the attached media.`
+- If no prompt and no media input are available, the CLI exits with a clear usage error
+- The CLI inspects prompt `MEDIA:` lines, environment variables such as `MEDIA_PATH`, and `OPENCLAW_CONTEXT` JSON for fallback media sources
+- If `--out` points at a directory, generated files are written into that directory with prompt-derived filenames
+- Successful runs print only `MEDIA:<path>` lines on stdout
+- Human-readable diagnostics stay on stderr, and `--quiet` suppresses non-essential stderr output
 
 ## Options
 
-- `--prompt, -p` Prompt text (or `-` to read stdin)
-- `--media, -m` Reference image path/URL (repeatable; first one is used for generation)
-- `--model` Model alias/name (default: `nano-banana-pro`)
-- `--count` Number of images (1-4)
-- `--out` Output path override
-- `--json` Save raw response to path
-- `--verbose, -v` Print request/debug details to stderr
+- `--prompt <text>`: explicit prompt text. Use `-` to read the prompt from stdin.
+- `--stdin`: read the prompt from stdin when no prompt argument is present.
+- `--media <path-or-url>`: repeatable reference image source.
+- `--model <alias-or-id>`: model alias or direct Gemini model id.
+- `--count <1..4>`: number of images to request.
+- `--out <path>`: output file path or directory. Multiple images append `_1`, `_2`, and so on.
+- `--json <path>`: save the raw API response to disk.
+- `--verbose`: print resolved model/media details to stderr.
+- `--quiet`: suppress non-essential stderr output.
 
-## Output contract
+## Notes
 
-Generated results are printed as plain lines. When images are returned, only generated attachments use `MEDIA:` lines:
-
-```text
-MEDIA:/absolute/path/to/file.png
-```
-
-No filesystem path chatter is printed unless you request `--verbose`.
+- Output filenames are sanitized from the prompt and made unique when needed.
+- Generated image bytes are decoded, MIME-checked, written to disk, and verified before the CLI prints the `MEDIA:` lines.

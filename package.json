@@ -1,36 +1,31 @@
 {
   "name": "banana-cli",
   "version": "0.1.0",
-  "description": "CLI for generating and editing images with Gemini image models",
-  "main": "src/index.js",
+  "description": "CLI for Gemini image generation and image editing prompts.",
+  "type": "module",
   "bin": {
     "banana": "./bin/banana.js"
   },
-  "type": "commonjs",
+  "files": [
+    "bin",
+    "src",
+    "README.md"
+  ],
   "scripts": {
-    "start": "node bin/banana.js",
-    "test": "node test/index.test.js",
-    "lint": "node --check src/index.js bin/banana.js"
-  },
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/staticpayload/banana-cli.git"
-  },
-  "homepage": "https://github.com/staticpayload/banana-cli#readme",
-  "bugs": {
-    "url": "https://github.com/staticpayload/banana-cli/issues"
+    "start": "node ./bin/banana.js",
+    "test": "node --test",
+    "lint": "node --check ./bin/banana.js && node --check ./src/index.js && node --check ./test/index.test.js"
   },
   "keywords": [
+    "cli",
     "gemini",
     "image-generation",
-    "cli",
     "banana"
   ],
-  "license": "MIT",
-  "dependencies": {
-    "yargs": "^17.7.2"
-  },
   "engines": {
     "node": ">=20"
+  },
+  "dependencies": {
+    "yargs": "^17.7.2"
   }
 }
