@@ -16,6 +16,7 @@ It implements the same behavior as the internal `nano-banana` skill:
 
 ```bash
 npm install
+npm link
 ```
 
 Set one of these env vars:
@@ -38,8 +39,11 @@ banana --media ./input.jpg "change this driver's suit to black merc f1 suit"
 # explicit model + count + explicit output + JSON dump
 banana --media ./input.jpg --model nano-banana-2 --count 2 --out ./output.png --json ./response.json "make this image cinematic"
 
-# read prompt from stdin
-cat prompt.txt | banana --prompt -
+# explicit --prompt
+banana --prompt "a brutalist banana logo on cream"
+
+# read prompt from stdin when no positional prompt is provided
+cat prompt.txt | banana
 ```
 
 ## Options
@@ -54,7 +58,7 @@ cat prompt.txt | banana --prompt -
 
 ## Output contract
 
-Generated results are printed as plain lines:
+Generated results are printed as plain lines. When images are returned, only generated attachments use `MEDIA:` lines:
 
 ```text
 MEDIA:/absolute/path/to/file.png

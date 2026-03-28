@@ -17,6 +17,7 @@ function test(name, fn) {
 console.log("banana-cli: internal helper tests");
 
 const origEnv = { ...process.env };
+const PNG_1X1_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7Z5WQAAAAASUVORK5CYII=";
 
 test("resolve model aliases", () => {
   assert.strictEqual(__internal.resolveModel("nano-banana-2"), "gemini-3.1-flash-image-preview");
@@ -48,10 +49,18 @@ test("output paths defaults", () => {
 
 test("env media includes env var and context", () => {
   process.env.MediaPath = "/from-env.jpg";
-  process.env.OPENCLAW_CONTEXT = JSON.stringify({ mediaPathUrl: "/from-context.json" });
+  process.env.OPENCLAW_CONTEXT = JSON.stringify({ mediaPathUrl: "/from-context.json", MEDIA_URLS: ["https://x/y.png"] });
   const media = __internal.envMediaSources();
   assert.ok(media.includes("/from-env.jpg"));
   assert.ok(media.includes("/from-context.json"));
+  assert.ok(media.includes("https://x/y.png"));
+});
+
+test("validate image buffer accepts png bytes", () => {
+  const raw = Buffer.from(PNG_1X1_BASE64, "base64");
+  const detected = __internal.validateImageBuffer(raw, "png");
+  assert.strictEqual(detected.mimeType, "image/png");
+  assert.strictEqual(detected.extension, ".png");
 });
 
 // cleanup env

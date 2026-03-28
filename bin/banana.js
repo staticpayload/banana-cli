@@ -6,5 +6,5 @@ const { run } = require("../src/index.js");
 
 run().catch((error) => {
   console.error(error.message || String(error));
-  process.exitCode = 1;
+  process.exitCode = Number.isInteger(error.exitCode) ? error.exitCode : 1;
 });

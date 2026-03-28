@@ -20,7 +20,7 @@ const MODEL_ALIASES = {
   "gemini-3-pro-image-preview": "gemini-3-pro-image-preview",
   "gemini-3.1-pro-preview": "gemini-3.1-pro-preview",
   "google/gemini-3-pro-image-preview": "nano-banana-pro-preview",
-  "google/nano-banana-pro-preview": "nano-banana-pro-preview",
+  "google/nano-banana-pro-preview": "nano-banana-pro-preview"
 };
 
 const MEDIA_LINE_RE = /^\s*MEDIA(?:_PATHS?|_URLS?)?:\s*(.+?)\s*$/i;
@@ -101,7 +101,7 @@ function parsePromptAndMedia(inputPrompt) {
 
   return {
     prompt: lines.join(" ").trim(),
-    media,
+    media
   };
 }
 
@@ -133,6 +133,10 @@ function collectMediaFromValue(out, value) {
       "mediapaths",
       "mediaurl",
       "mediaurls",
+      "media_path",
+      "media_paths",
+      "media_url",
+      "media_urls",
       "path",
       "paths",
       "url",
@@ -144,7 +148,8 @@ function collectMediaFromValue(out, value) {
       "attachments",
       "attachment",
       "image",
-      "source",
+      "images",
+      "source"
     ];
 
     for (const [key, child] of Object.entries(value)) {
@@ -157,7 +162,15 @@ function collectMediaFromValue(out, value) {
       collectMediaFromValue(out, value.media);
     }
 
-    const nestedPaths = value.mediaPath || value.MediaPath || value.mediaPaths || value.MediaPaths;
+    const nestedPaths =
+      value.mediaPath ||
+      value.MediaPath ||
+      value.mediaPaths ||
+      value.MediaPaths ||
+      value.mediaUrl ||
+      value.MediaUrl ||
+      value.mediaUrls ||
+      value.MediaUrls;
     if (nestedPaths !== undefined) {
       collectMediaFromValue(out, nestedPaths);
     }
@@ -177,14 +190,17 @@ function envMediaSources() {
     "mediaUrls",
     "MEDIA_PATH",
     "MEDIA_PATHS",
+    "MEDIA_URL",
+    "MEDIA_URLS",
     "OPENCLAW_MEDIA",
     "OPENCLAW_MEDIA_PATH",
     "OPENCLAW_MEDIA_PATHS",
     "OPENCLAW_MEDIA_URL",
     "OPENCLAW_MEDIA_URLS",
+    "MEDIA",
     "media",
     "mediaPathUrl",
-    "MediaPathUrl",
+    "MediaPathUrl"
   ];
 
   for (const key of keys) {
@@ -230,60 +246,54 @@ function isHttpUrl(source) {
   }
 }
 
-function guessMime(source, data) {
-  const ext = path.extname(source || "").toLowerCase();
-  const byExt = {
-    ".png": "image/png",
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".webp": "image/webp",
-    ".gif": "image/gif",
-  };
-
-  if (byExt[ext]) {
-    return byExt[ext];
+function detectImageType(data) {
+  if (!Buffer.isBuffer(data) || data.length < 12) {
+    return null;
   }
 
-  const signature = data.subarray(0, 12);
-  // PNG
   if (
-    signature[0] === 0x89 &&
-    signature[1] === 0x50 &&
-    signature[2] === 0x4e &&
-    signature[3] === 0x47
+    data[0] === 0x89 &&
+    data[1] === 0x50 &&
+    data[2] === 0x4e &&
+    data[3] === 0x47 &&
+    data[4] === 0x0d &&
+    data[5] === 0x0a &&
+    data[6] === 0x1a &&
+    data[7] === 0x0a
   ) {
-    return "image/png";
+    return { mimeType: "image/png", extension: ".png" };
   }
 
-  // JPG
-  if (signature[0] === 0xff && signature[1] === 0xd8) {
-    return "image/jpeg";
+  if (data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) {
+    return { mimeType: "image/jpeg", extension: ".jpg" };
   }
 
-  // GIF
   if (
-    signature[0] === 0x47 &&
-    signature[1] === 0x49 &&
-    signature[2] === 0x46
+    data[0] === 0x47 &&
+    data[1] === 0x49 &&
+    data[2] === 0x46 &&
+    (data.subarray(0, 6).toString("ascii") === "GIF87a" ||
+      data.subarray(0, 6).toString("ascii") === "GIF89a")
   ) {
-    return "image/gif";
+    return { mimeType: "image/gif", extension: ".gif" };
   }
 
-  // WEBP "RIFF....WEBP"
   if (
-    signature[0] === 0x52 &&
-    signature[1] === 0x49 &&
-    signature[2] === 0x46 &&
-    signature[3] === 0x46 &&
-    signature[8] === 0x57 &&
-    signature[9] === 0x45 &&
-    signature[10] === 0x42 &&
-    signature[11] === 0x50
+    data.subarray(0, 4).toString("ascii") === "RIFF" &&
+    data.subarray(8, 12).toString("ascii") === "WEBP"
   ) {
-    return "image/webp";
+    return { mimeType: "image/webp", extension: ".webp" };
   }
 
-  return "image/png";
+  return null;
+}
+
+function validateImageBuffer(data, label) {
+  const detected = detectImageType(data);
+  if (!detected) {
+    throw new Error(`Invalid or unsupported image data${label ? ` for ${label}` : ""}`);
+  }
+  return detected;
 }
 
 async function loadMedia(source) {
@@ -293,26 +303,28 @@ async function loadMedia(source) {
   }
 
   let data;
-  let mime;
 
   if (isHttpUrl(cleanSource)) {
-    const response = await fetch(cleanSource);
-    if (!response.ok) {
-      throw new Error(`Failed to fetch media: ${response.status} ${response.statusText}`);
-    }
-    data = Buffer.from(await response.arrayBuffer());
-    const contentType = response.headers.get("content-type");
-    if (contentType && contentType.startsWith("image/")) {
-      mime = contentType;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30000);
+    try {
+      const response = await fetch(cleanSource, { signal: controller.signal });
+      if (!response.ok) {
+        throw new Error(`Failed to fetch media: ${response.status} ${response.statusText}`);
+      }
+      data = Buffer.from(await response.arrayBuffer());
+    } finally {
+      clearTimeout(timeout);
     }
   } else {
     const fullPath = path.resolve(cleanSource);
     data = await fs.promises.readFile(fullPath);
   }
 
+  const detected = validateImageBuffer(data, cleanSource);
   return {
     data: data.toString("base64"),
-    mimeType: mime || guessMime(cleanSource, data),
+    mimeType: detected.mimeType
   };
 }
 
@@ -324,7 +336,7 @@ function toOutputPaths(basePrompt, images, outputFlag) {
       "image/png": ".png",
       "image/jpeg": ".jpg",
       "image/webp": ".webp",
-      "image/gif": ".gif",
+      "image/gif": ".gif"
     };
 
     return map[mime] || ".png";
@@ -340,21 +352,15 @@ function toOutputPaths(basePrompt, images, outputFlag) {
 
   if (outputFlag) {
     const requested = path.resolve(outputFlag);
+    const parsed = path.parse(requested);
+    const stem = parsed.name.trim() || "image";
+    const directory = parsed.dir || process.cwd();
+
     if (images.length === 1) {
-      const requestedExt = path.extname(requested);
-    const outPath = ensureParent(
-      requestedExt
-        ? requested
-        : `${requested}.png`
-    );
-      result.push(outPath);
+      const suffix = chooseSuffix(images[0].mimeType);
+      result.push(ensureParent(path.resolve(directory, `${stem}${suffix}`)));
       return result;
     }
-
-    const stem = path
-      .parse(requested)
-      .name.trim();
-    const directory = path.dirname(requested);
 
     for (let i = 0; i < images.length; i += 1) {
       const suffix = chooseSuffix(images[i].mimeType);
@@ -372,6 +378,23 @@ function toOutputPaths(basePrompt, images, outputFlag) {
   }
 
   return result;
+}
+
+function extractTextParts(parsed) {
+  const lines = [];
+
+  if (Array.isArray(parsed?.candidates)) {
+    for (const candidate of parsed.candidates) {
+      const parts = candidate?.content?.parts || [];
+      for (const part of parts) {
+        if (typeof part?.text === "string" && part.text.trim()) {
+          lines.push(part.text.trim());
+        }
+      }
+    }
+  }
+
+  return Array.from(new Set(lines));
 }
 
 async function extractPrompt(args) {
@@ -407,48 +430,48 @@ async function extractPrompt(args) {
 
   return {
     prompt: finalPrompt,
-    inlineMedia: cleaned.media,
+    inlineMedia: cleaned.media
   };
 }
 
 async function run() {
   const argv = yargs(hideBin(process.argv))
     .scriptName("banana")
-    .usage("$0 [options] <prompt>")
+    .usage("$0 [options] [prompt]")
     .option("prompt", {
       alias: "p",
       type: "string",
-      describe: "Prompt text (or use '-' to read stdin)",
+      describe: "Prompt text (or use '-' to read stdin)"
     })
     .option("media", {
       alias: "m",
       type: "string",
       array: true,
-      describe: "Reference image path or URL (repeatable)",
+      describe: "Reference image path or URL (repeatable)"
     })
     .option("model", {
       type: "string",
       default: "nano-banana-pro",
-      describe: "Model alias/name",
+      describe: "Model alias/name"
     })
     .option("count", {
       type: "number",
       default: 1,
-      describe: "Images to request (1-4)",
+      describe: "Images to request (1-4)"
     })
     .option("out", {
       type: "string",
-      describe: "Output path (optional)",
+      describe: "Output path (optional)"
     })
     .option("json", {
       type: "string",
-      describe: "Write full API response JSON to this path",
+      describe: "Write full API response JSON to this path"
     })
     .option("verbose", {
       alias: "v",
       type: "boolean",
       default: false,
-      describe: "Print request details to stderr",
+      describe: "Print request details to stderr"
     })
     .help()
     .strict()
@@ -488,8 +511,8 @@ async function run() {
     contents: [{ parts }],
     generationConfig: {
       responseModalities: ["IMAGE", "TEXT"],
-      candidateCount: effectiveCount,
-    },
+      candidateCount: effectiveCount
+    }
   };
 
   const model = resolveModel(argv.model);
@@ -501,13 +524,21 @@ async function run() {
 
   const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
 
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-    },
-    body: JSON.stringify(payload),
-  });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 60000);
+  let response;
+  try {
+    response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
 
   const responseText = await response.text();
 
@@ -518,18 +549,22 @@ async function run() {
   const parsed = JSON.parse(responseText);
   if (argv.json) {
     const jsonPath = path.resolve(argv.json);
+    await fs.promises.mkdir(path.dirname(jsonPath), { recursive: true });
     await fs.promises.writeFile(jsonPath, JSON.stringify(parsed, null, 2), "utf8");
   }
 
+  const textLines = extractTextParts(parsed);
   const images = [];
   if (Array.isArray(parsed?.candidates)) {
     for (const candidate of parsed.candidates) {
-      const parts = candidate?.content?.parts || [];
-      for (const part of parts) {
-        if (part?.inlineData?.data && part?.inlineData?.mimeType) {
+      const candidateParts = candidate?.content?.parts || [];
+      for (const part of candidateParts) {
+        if (part?.inlineData?.data) {
+          const raw = Buffer.from(part.inlineData.data, "base64");
+          const detected = validateImageBuffer(raw, "Gemini response");
           images.push({
             data: part.inlineData.data,
-            mimeType: part.inlineData.mimeType,
+            mimeType: detected.mimeType
           });
         }
       }
@@ -538,10 +573,12 @@ async function run() {
 
   if (!images.length && Array.isArray(parsed?.generatedImages)) {
     for (const generated of parsed.generatedImages) {
-      if (generated?.inlineData?.data && generated?.inlineData?.mimeType) {
+      if (generated?.inlineData?.data) {
+        const raw = Buffer.from(generated.inlineData.data, "base64");
+        const detected = validateImageBuffer(raw, "Gemini response");
         images.push({
           data: generated.inlineData.data,
-          mimeType: generated.inlineData.mimeType,
+          mimeType: detected.mimeType
         });
       }
     }
@@ -560,10 +597,15 @@ async function run() {
     console.error(`Output: ${argv.out || "./<auto>"}`);
   }
 
+  for (const line of textLines) {
+    console.log(line);
+  }
+
   for (let i = 0; i < images.length; i += 1) {
     const outputPath = targetPaths[i];
     const image = images[i];
     const raw = Buffer.from(image.data, "base64");
+    validateImageBuffer(raw, outputPath);
 
     await fs.promises.writeFile(outputPath, raw);
 
@@ -585,5 +627,7 @@ module.exports = {
     toOutputPaths,
     resolveModel,
     envMediaSources,
-  },
+    detectImageType,
+    validateImageBuffer
+  }
 };
